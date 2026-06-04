@@ -11,6 +11,7 @@
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <std_msgs/Float64MultiArray.h>
 
 #include <cmath>
 #include <iostream>
@@ -80,6 +81,8 @@ private:
     ros::NodeHandle nh;
     ros::Subscriber mapSub;
     ros::Subscriber targetSub;
+    ros::Subscriber planReqSub;
+    ros::Publisher  exprtPub;
 
     bool mapInitialized;
     voxel_map::VoxelMap voxelMap;
@@ -110,6 +113,10 @@ public:
 
         targetSub = nh.subscribe(config.targetTopic, 1, &GlobalPlanner::targetCallBack, this,
                                  ros::TransportHints().tcpNoDelay());
+
+        planReqSub = nh.subscribe("/nmp/plan_request", 1, &GlobalPlanner::planReqCallBack, this,
+                                  ros::TransportHints().tcpNoDelay());
+        exprtPub = nh.advertise<std_msgs::Float64MultiArray>("/nmp/expert_traj", 1);
     }
 
     inline void mapCallBack(const sensor_msgs::PointCloud2::ConstPtr &msg)
@@ -227,6 +234,99 @@ public:
                 }
             }
         }
+    }
+
+    // NMP data collection: programmatic plan request + trajectory publish.
+    // Mirrors plan() but takes start/goal + start velocity from the request and
+    // serializes the optimized MINCO trajectory onto /nmp/expert_traj.
+    inline void planReqCallBack(const std_msgs::Float64MultiArray::ConstPtr &msg)
+    {
+        std_msgs::Float64MultiArray out;
+        if (!mapInitialized || msg->data.size() < 10)
+        {
+            out.data.push_back(0.0);          // not ready / bad request
+            exprtPub.publish(out);
+            return;
+        }
+        const Eigen::Vector3d s(msg->data[0], msg->data[1], msg->data[2]);
+        const Eigen::Vector3d sv(msg->data[4], msg->data[5], msg->data[6]);
+        const Eigen::Vector3d g(msg->data[7], msg->data[8], msg->data[9]);
+
+        std::vector<Eigen::Vector3d> route;
+        sfc_gen::planPath<voxel_map::VoxelMap>(s, g,
+                                               voxelMap.getOrigin(),
+                                               voxelMap.getCorner(),
+                                               &voxelMap, 0.01,
+                                               route);
+        std::vector<Eigen::MatrixX4d> hPolys;
+        std::vector<Eigen::Vector3d> pc;
+        voxelMap.getSurf(pc);
+        sfc_gen::convexCover(route, pc,
+                             voxelMap.getOrigin(), voxelMap.getCorner(),
+                             7.0, 3.0, hPolys);
+        sfc_gen::shortCut(hPolys);
+
+        if (route.size() > 1)
+        {
+            Eigen::Matrix3d iniState;
+            Eigen::Matrix3d finState;
+            iniState << route.front(), sv, Eigen::Vector3d::Zero();   // start velocity from request
+            finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
+
+            gcopter::GCOPTER_PolytopeSFC gcopter;
+            Eigen::VectorXd magnitudeBounds(5);
+            Eigen::VectorXd penaltyWeights(5);
+            Eigen::VectorXd physicalParams(6);
+            magnitudeBounds(0) = config.maxVelMag;
+            magnitudeBounds(1) = config.maxBdrMag;
+            magnitudeBounds(2) = config.maxTiltAngle;
+            magnitudeBounds(3) = config.minThrust;
+            magnitudeBounds(4) = config.maxThrust;
+            penaltyWeights(0) = (config.chiVec)[0];
+            penaltyWeights(1) = (config.chiVec)[1];
+            penaltyWeights(2) = (config.chiVec)[2];
+            penaltyWeights(3) = (config.chiVec)[3];
+            penaltyWeights(4) = (config.chiVec)[4];
+            physicalParams(0) = config.vehicleMass;
+            physicalParams(1) = config.gravAcc;
+            physicalParams(2) = config.horizDrag;
+            physicalParams(3) = config.vertDrag;
+            physicalParams(4) = config.parasDrag;
+            physicalParams(5) = config.speedEps;
+            const int quadratureRes = config.integralIntervs;
+
+            traj.clear();
+            if (gcopter.setup(config.weightT, iniState, finState, hPolys, INFINITY,
+                              config.smoothingEps, quadratureRes,
+                              magnitudeBounds, penaltyWeights, physicalParams) &&
+                !std::isinf(gcopter.optimize(traj, config.relCostTol)) &&
+                traj.getPieceNum() > 0)
+            {
+                trajStamp = ros::Time::now().toSec();
+                visualizer.visualize(traj, route);
+
+                const int N = traj.getPieceNum();
+                const Eigen::VectorXd T = traj.getDurations();
+                const double tot = traj.getTotalDuration();
+                const double dt = 0.05;
+                const int K = (int)std::floor(tot / dt) + 1;
+                out.data.push_back(1.0);                 // success
+                out.data.push_back((double)N);
+                for (int i = 0; i < N; ++i) out.data.push_back(T(i));
+                out.data.push_back((double)K);
+                for (int k = 0; k < K; ++k)
+                {
+                    const Eigen::Vector3d x = traj.getPos(std::min(k * dt, tot));
+                    out.data.push_back(x.x());
+                    out.data.push_back(x.y());
+                    out.data.push_back(x.z());
+                }
+                exprtPub.publish(out);
+                return;
+            }
+        }
+        out.data.push_back(0.0);                          // planning failed
+        exprtPub.publish(out);
     }
 
     inline void targetCallBack(const geometry_msgs::PoseStamped::ConstPtr &msg)
