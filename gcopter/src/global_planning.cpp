@@ -253,11 +253,27 @@ public:
         const Eigen::Vector3d g(msg->data[7], msg->data[8], msg->data[9]);
 
         std::vector<Eigen::Vector3d> route;
-        sfc_gen::planPath<voxel_map::VoxelMap>(s, g,
-                                               voxelMap.getOrigin(),
-                                               voxelMap.getCorner(),
-                                               &voxelMap, 0.01,
-                                               route);
+        try                               // informed RRT* (OMPL) throws on degenerate
+        {                                 // geometry (e.g. start==goal PHS); catch it
+            sfc_gen::planPath<voxel_map::VoxelMap>(s, g,
+                                                   voxelMap.getOrigin(),
+                                                   voxelMap.getCorner(),
+                                                   &voxelMap, 0.01,
+                                                   route);
+        }
+        catch (const std::exception &e)
+        {
+            ROS_WARN("planReqCallBack: planPath threw (%s) -> failure", e.what());
+            out.data.push_back(0.0);
+            exprtPub.publish(out);
+            return;
+        }
+        if (route.size() <= 1)            // start/goal in obstacle or unreachable:
+        {                                 // convexCover() segfaults on a degenerate route
+            out.data.push_back(0.0);
+            exprtPub.publish(out);
+            return;
+        }
         std::vector<Eigen::MatrixX4d> hPolys;
         std::vector<Eigen::Vector3d> pc;
         voxelMap.getSurf(pc);
